@@ -1,0 +1,15 @@
+diff --git a/apex/Android.bp b/apex/Android.bp
+index 3e20230..a460086 100644
+--- a/apex/Android.bp
++++ b/apex/Android.bp
+@@ -89,3 +89,10 @@ apex_vndk {
+     system_ext_specific: true,
+ }
+ 
++// Compatibility with legacy Sony vendor blobs (VNDK 28).
++apex_vndk {
++    name: "com.android.vndk.v28",
++    defaults: ["vndk-apex-defaults"],
++    vndk_version: "28",
++    system_ext_specific: true,
++}

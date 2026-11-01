@@ -1,0 +1,509 @@
+diff --git a/init/action.cpp b/init/action.cpp
+index 18f636042..a4f774612 100644
+--- a/init/action.cpp
++++ b/init/action.cpp
+@@ -15,6 +15,7 @@
+  */
+ 
+ #include "action.h"
++#include "dora21_trace.h"
+ 
+ #include <android-base/chrono_utils.h>
+ #include <android-base/logging.h>
+@@ -157,10 +158,44 @@ void Action::ExecuteAllCommands() const {
+ }
+ 
+ void Action::ExecuteCommand(const Command& command) const {
++    const std::string full = command.BuildCommandString();
++    const std::string op = full.substr(0, full.find(' '));
++
++    const bool important =
++        op == "mount_all" ||
++        op == "wait" ||
++        op == "wait_for_prop" ||
++        op == "wait_for_coldboot_done" ||
++        op == "exec" ||
++        op == "exec_start" ||
++        op == "start" ||
++        op == "class_start" ||
++        op == "trigger" ||
++        op == "swapon_all";
++
++    const std::string marker =
++        op + " @" + filename_ + ":" +
++        std::to_string(command.line());
++
++    if (important) {
++        Dora21Trace(("CMD_BEGIN " + marker).c_str());
++    }
++
+     android::base::Timer t;
+     auto result = command.InvokeFunc(subcontext_);
+     auto duration = t.duration();
+ 
++    if (important) {
++        if (result.ok()) {
++            Dora21Trace(("CMD_END " + marker + " OK").c_str());
++        } else {
++            const std::string error_message =
++                    "CMD_END " + marker + " FAILED: " +
++                    result.error().message();
++            Dora21Trace(error_message.c_str());
++        }
++    }
++
+     // Any action longer than 50ms will be warned to user as slow operation
+     if (!result.has_value() || duration > 50ms ||
+         android::base::GetMinimumLogSeverity() <= android::base::DEBUG) {
+diff --git a/init/action_manager.cpp b/init/action_manager.cpp
+index b45f5cd18..7ce67e163 100644
+--- a/init/action_manager.cpp
++++ b/init/action_manager.cpp
+@@ -15,6 +15,7 @@
+  */
+ 
+ #include "action_manager.h"
++#include "dora21_trace.h"
+ 
+ #include <android-base/logging.h>
+ 
+@@ -85,6 +86,14 @@ void ActionManager::ExecuteOneCommand() {
+ 
+     auto action = current_executing_actions_.front();
+ 
++    if (current_command_ == 0) {
++        const std::string marker =
++            "ACTION_BEGIN " + action->BuildTriggersString() +
++            " @" + action->filename() + ":" +
++            std::to_string(action->line());
++        Dora21Trace(marker.c_str());
++    }
++
+     if (current_command_ == 0) {
+         std::string trigger_name = action->BuildTriggersString();
+         LOG(INFO) << "processing action (" << trigger_name << ") from (" << action->filename()
+@@ -93,6 +102,14 @@ void ActionManager::ExecuteOneCommand() {
+ 
+     action->ExecuteOneCommand(current_command_);
+ 
++    if (current_command_ + 1 == action->NumCommands()) {
++        const std::string marker =
++            "ACTION_END " + action->BuildTriggersString() +
++            " @" + action->filename() + ":" +
++            std::to_string(action->line());
++        Dora21Trace(marker.c_str());
++    }
++
+     // If this was the last command in the current action, then remove
+     // the action from the executing list.
+     // If this action was oneshot, then also remove it from actions_.
+diff --git a/init/dora21_trace.h b/init/dora21_trace.h
+new file mode 100644
+index 000000000..405a9ae1e
+--- /dev/null
++++ b/init/dora21_trace.h
+@@ -0,0 +1,57 @@
++#pragma once
++// DORA21_ACTION_TRACE_V2
++#include <cerrno>
++#include <fcntl.h>
++#include <string>
++#include <sys/mount.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <android-base/logging.h>
++
++static inline void Dora21Trace(const char* label) {
++    LOG(INFO) << "DORA21 " << label;
++
++    struct stat root_st{}, cache_st{};
++    bool cache_mounted =
++        stat("/", &root_st) == 0 &&
++        stat("/cache", &cache_st) == 0 &&
++        root_st.st_dev != cache_st.st_dev;
++
++    const char* dir = cache_mounted
++        ? "/cache" : "/dev/dora21_trace";
++
++    bool mounted_here = false;
++
++    if (!cache_mounted) {
++        if (mkdir(dir, 0700) && errno != EEXIST) return;
++
++        if (mount("/dev/block/by-name/cache", dir, "ext4",
++                  MS_NOATIME | MS_NODEV | MS_NOSUID,
++                  nullptr) != 0) {
++            PLOG(ERROR) << "DORA21 cache mount failed";
++            return;
++        }
++        mounted_here = true;
++    }
++
++    const std::string filename =
++        std::string(dir) + "/dora-los21-firststage.log";
++
++    int fd = open(filename.c_str(),
++                  O_WRONLY | O_CREAT | O_APPEND |
++                  O_CLOEXEC | O_NOFOLLOW, 0644);
++
++    if (fd >= 0) {
++        const std::string line =
++            std::string("DORA21 ") + label + "\n";
++        (void)write(fd, line.data(), line.size());
++        (void)fsync(fd);
++        close(fd);
++    } else {
++        PLOG(ERROR) << "DORA21 log open failed";
++    }
++
++    if (mounted_here && umount(dir) != 0) {
++        PLOG(ERROR) << "DORA21 cache umount failed";
++    }
++}
+diff --git a/init/first_stage_init.cpp b/init/first_stage_init.cpp
+index c4d0f758d..177afb655 100644
+--- a/init/first_stage_init.cpp
++++ b/init/first_stage_init.cpp
+@@ -28,6 +28,7 @@
+ #include <unistd.h>
+ 
+ #include <chrono>
++#include <cerrno>
+ #include <filesystem>
+ #include <string>
+ #include <thread>
+@@ -43,6 +44,7 @@
+ #include "debug_ramdisk.h"
+ #include "first_stage_console.h"
+ #include "first_stage_mount.h"
++#include "block_dev_initializer.h"
+ #include "reboot_utils.h"
+ #include "second_stage_resources.h"
+ #include "snapuserd_transition.h"
+@@ -312,6 +314,57 @@ static std::unique_ptr<FirstStageMount> CreateFirstStageMount(const std::string&
+     }
+ }
+ 
++
++// DORA21_CACHE_CHECKPOINT: temporary early boot diagnostics.
++static void DoraCacheCheckpoint(const char* label) {
++    LOG(INFO) << "DORA21 " << label;
++
++    // Android first-stage init runs before ueventd.
++    // Discover the cache partition independently.
++    if (access("/dev/block/by-name/cache", F_OK) != 0) {
++        static bool attempted = false;
++        if (!attempted) {
++            attempted = true;
++            BlockDevInitializer probe;
++            (void)probe.InitDevices({"cache"});
++        }
++    }
++
++    constexpr char kMountPoint[] = "/dev/dora_cache_trace";
++    constexpr char kDevice[] = "/dev/block/by-name/cache";
++
++    if (mkdir(kMountPoint, 0700) != 0 && errno != EEXIST) {
++        PLOG(ERROR) << "DORA21 cannot create cache mount point";
++        return;
++    }
++
++    if (mount(kDevice, kMountPoint, "ext4",
++              MS_NOATIME | MS_NODEV | MS_NOSUID, nullptr) != 0) {
++        PLOG(ERROR) << "DORA21 cannot mount cache";
++        return;
++    }
++
++    const std::string path =
++            std::string(kMountPoint) + "/dora-los21-firststage.log";
++
++    int fd = open(path.c_str(),
++                  O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW,
++                  0644);
++
++    if (fd >= 0) {
++        const std::string line = std::string("DORA21 ") + label + "\n";
++        (void)write(fd, line.data(), line.size());
++        (void)fsync(fd);
++        close(fd);
++    } else {
++        PLOG(ERROR) << "DORA21 cannot open trace file";
++    }
++
++    if (umount(kMountPoint) != 0) {
++        PLOG(ERROR) << "DORA21 cannot unmount cache";
++    }
++}
++
+ int FirstStageMain(int argc, char** argv) {
+     if (REBOOT_BOOTLOADER_ON_PANIC) {
+         InstallRebootSignalHandlers();
+@@ -392,8 +445,10 @@ int FirstStageMain(int argc, char** argv) {
+     // Now that tmpfs is mounted on /dev and we have /dev/kmsg, we can actually
+     // talk to the outside world...
+     InitKernelLogging(argv);
++    DoraCacheCheckpoint("01_FIRST_STAGE_STARTED");
+ 
+     if (!errors.empty()) {
++        DoraCacheCheckpoint("02_INIT_SETUP_FAILED");
+         for (const auto& [error_string, error_errno] : errors) {
+             LOG(ERROR) << error_string << " " << strerror(error_errno);
+         }
+@@ -516,16 +571,24 @@ int FirstStageMain(int argc, char** argv) {
+             fsm = CreateFirstStageMount(cmdline);
+         }
+         if (!fsm) {
++            DoraCacheCheckpoint("03_FSTAB_FAILED");
+             LOG(FATAL) << "FirstStageMount not available";
+         }
++        DoraCacheCheckpoint("04_FSTAB_READY");
+ 
++        DoraCacheCheckpoint("05_BEFORE_BLOCK_DEVICES");
+         if (!created_devices && !fsm->DoCreateDevices()) {
++            DoraCacheCheckpoint("06_BLOCK_DEVICES_FAILED");
+             LOG(FATAL) << "Failed to create devices required for first stage mount";
+         }
++        DoraCacheCheckpoint("07_BLOCK_DEVICES_READY");
+ 
++        DoraCacheCheckpoint("08_BEFORE_EARLY_MOUNT");
+         if (!fsm->DoFirstStageMount()) {
++            DoraCacheCheckpoint("09_EARLY_MOUNT_FAILED");
+             LOG(FATAL) << "Failed to mount required partitions early ...";
+         }
++        DoraCacheCheckpoint("10_EARLY_MOUNT_OK");
+     }
+ 
+     struct stat new_root_info {};
+@@ -549,7 +612,9 @@ int FirstStageMain(int argc, char** argv) {
+     dup2(fd, STDOUT_FILENO);
+     dup2(fd, STDERR_FILENO);
+     close(fd);
++    DoraCacheCheckpoint("11_BEFORE_SELINUX_EXEC");
+     execv(path, const_cast<char**>(args));
++    DoraCacheCheckpoint("12_SELINUX_EXEC_FAILED");
+ 
+     // execv() only returns if an error happened, in which case we
+     // panic and never fall through this conditional.
+diff --git a/init/init.cpp b/init/init.cpp
+index aeccd6696..86dfa756e 100644
+--- a/init/init.cpp
++++ b/init/init.cpp
+@@ -15,6 +15,7 @@
+  */
+ 
+ #include "init.h"
++#include "dora21_trace.h"
+ 
+ #include <dirent.h>
+ #include <fcntl.h>
+@@ -939,11 +940,15 @@ int SecondStageMain(int argc, char** argv) {
+     // is blocked. See b/223076262
+     boot_clock::time_point start_time = boot_clock::now();
+ 
+-    trigger_shutdown = [](const std::string& command) { shutdown_state.TriggerShutdown(command); };
++    trigger_shutdown = [](const std::string& command) {
++        Dora21Trace((std::string("SHUTDOWN_REQUEST ") + command).c_str());
++        shutdown_state.TriggerShutdown(command);
++    };
+ 
+     SetStdioToDevNull(argv);
+     InitKernelLogging(argv);
+     LOG(INFO) << "init second stage started!";
++    Dora21Trace("31_SECOND_STAGE_STARTED");
+ 
+     SelinuxSetupKernelLogging();
+ 
+@@ -993,7 +998,9 @@ int SecondStageMain(int argc, char** argv) {
+         UmountDebugRamdisk();
+     }
+ 
++    Dora21Trace("32_BEFORE_PROPERTY_INIT");
+     PropertyInit();
++    Dora21Trace("33_PROPERTY_INIT_OK");
+ 
+     // Umount second stage resources after property service has read the .prop files.
+     UmountSecondStageRes();
+@@ -1007,8 +1014,10 @@ int SecondStageMain(int argc, char** argv) {
+     MountExtraFilesystems();
+ 
+     // Now set up SELinux for second stage.
++    Dora21Trace("34_BEFORE_SELABEL");
+     SelabelInitialize();
+     SelinuxRestoreContext();
++    Dora21Trace("35_SELABEL_READY");
+ 
+     Epoll epoll;
+     if (auto result = epoll.Open(); !result.ok()) {
+@@ -1022,7 +1031,9 @@ int SecondStageMain(int argc, char** argv) {
+ 
+     InstallSignalFdHandler(&epoll);
+     InstallInitNotifier(&epoll);
++    Dora21Trace("36_BEFORE_PROPERTY_SERVICE");
+     StartPropertyService(&property_fd);
++    Dora21Trace("37_PROPERTY_SERVICE_READY");
+ 
+     // Make the time that init stages started available for bootstat to log.
+     RecordStageBoottimes(start_time);
+@@ -1051,7 +1062,9 @@ int SecondStageMain(int argc, char** argv) {
+     ActionManager& am = ActionManager::GetInstance();
+     ServiceList& sm = ServiceList::GetInstance();
+ 
++    Dora21Trace("38_BEFORE_BOOT_SCRIPTS");
+     LoadBootScripts(am, sm);
++    Dora21Trace("39_BOOT_SCRIPTS_LOADED");
+ 
+     // Turning this on and letting the INFO logging be discarded adds 0.2s to
+     // Nexus 9 boot time, so it's disabled by default.
+@@ -1106,6 +1119,10 @@ int SecondStageMain(int argc, char** argv) {
+ 
+     // Restore prio before main loop
+     setpriority(PRIO_PROCESS, 0, 0);
++    Dora21Trace("40_ENTER_INIT_EVENT_LOOP");
++    bool reported_property_wait = false;
++    bool reported_exec_wait = false;
++
+     while (true) {
+         // By default, sleep until something happens. Do not convert far_future into
+         // std::chrono::milliseconds because that would trigger an overflow. The unit of boot_clock
+@@ -1120,7 +1137,22 @@ int SecondStageMain(int argc, char** argv) {
+             HandlePowerctlMessage(*shutdown_command);
+         }
+ 
+-        if (!(prop_waiter_state.MightBeWaiting() || Service::is_exec_service_running())) {
++        const bool property_wait = prop_waiter_state.MightBeWaiting();
++        const bool exec_wait = Service::is_exec_service_running();
++
++        if (property_wait != reported_property_wait) {
++            Dora21Trace(property_wait
++                ? "WAIT_PROPERTY_BEGIN" : "WAIT_PROPERTY_END");
++            reported_property_wait = property_wait;
++        }
++
++        if (exec_wait != reported_exec_wait) {
++            Dora21Trace(exec_wait
++                ? "WAIT_EXEC_BEGIN" : "WAIT_EXEC_END");
++            reported_exec_wait = exec_wait;
++        }
++
++        if (!(property_wait || exec_wait)) {
+             am.ExecuteOneCommand();
+             // If there's more work to do, wake up again immediately.
+             if (am.HasMoreCommands()) {
+diff --git a/init/selinux.cpp b/init/selinux.cpp
+index 1f211ddfa..0a425476a 100644
+--- a/init/selinux.cpp
++++ b/init/selinux.cpp
+@@ -50,6 +50,7 @@
+ //    the SEPolicy is compiled if needed.
+ 
+ #include "selinux.h"
++#include "dora21_trace.h"
+ 
+ #include <android/api-level.h>
+ #include <fcntl.h>
+@@ -748,13 +749,17 @@ void LoadSelinuxPolicyMicrodroid() {
+ //
+ // After this sequence, it is safe to enable enforcing mode and continue booting.
+ void LoadSelinuxPolicyAndroid() {
++    Dora21Trace("21_BEFORE_POLICY_PREPARE");
+     MountMissingSystemPartitions();
++    Dora21Trace("22_AFTER_POLICY_PREPARE");
+ 
+     LOG(INFO) << "Opening SELinux policy";
+ 
+     // Read the policy before potentially killing snapuserd.
+     std::string policy;
++    Dora21Trace("23_BEFORE_READ_POLICY");
+     ReadPolicy(&policy);
++    Dora21Trace("24_POLICY_READ_OK");
+ 
+     auto snapuserd_helper = SnapuserdSelinuxHelper::CreateIfNeeded();
+     if (snapuserd_helper) {
+@@ -763,7 +768,9 @@ void LoadSelinuxPolicyAndroid() {
+         snapuserd_helper->StartTransition();
+     }
+ 
++    Dora21Trace("25_BEFORE_KERNEL_POLICY_LOAD");
+     LoadSelinuxPolicy(policy);
++    Dora21Trace("26_KERNEL_POLICY_LOADED");
+ 
+     if (snapuserd_helper) {
+         // Before enforcing, finish the pending snapuserd transition.
+@@ -775,6 +782,7 @@ void LoadSelinuxPolicyAndroid() {
+ int SetupSelinux(char** argv) {
+     SetStdioToDevNull(argv);
+     InitKernelLogging(argv);
++    Dora21Trace("20_SELINUX_SETUP_STARTED");
+ 
+     if (REBOOT_BOOTLOADER_ON_PANIC) {
+         InstallRebootSignalHandlers();
+@@ -791,7 +799,9 @@ int SetupSelinux(char** argv) {
+         LoadSelinuxPolicyAndroid();
+     }
+ 
++    Dora21Trace("27_BEFORE_ENFORCEMENT");
+     SelinuxSetEnforcement();
++    Dora21Trace("28_AFTER_ENFORCEMENT");
+ 
+     // We're in the kernel domain and want to transition to the init domain.  File systems that
+     // store SELabels in their xattrs, such as ext4 do not need an explicit restorecon here,
+@@ -805,7 +815,9 @@ int SetupSelinux(char** argv) {
+ 
+     const char* path = "/system/bin/init";
+     const char* args[] = {path, "second_stage", nullptr};
++    Dora21Trace("29_BEFORE_SECOND_STAGE_EXEC");
+     execv(path, const_cast<char**>(args));
++    Dora21Trace("30_SECOND_STAGE_EXEC_FAILED");
+ 
+     // execv() only returns if an error happened, in which case we
+     // panic and never return from this function.
+diff --git a/init/service.cpp b/init/service.cpp
+index e7d710baf..bbdf0d1a9 100644
+--- a/init/service.cpp
++++ b/init/service.cpp
+@@ -14,6 +14,7 @@
+  * limitations under the License.
+  */
+ 
++#include "dora21_trace.h"
+ #include "service.h"
+ 
+ #include <errno.h>
+@@ -261,6 +262,16 @@ void Service::SetProcessAttributesAndCaps(InterprocessFifo setsid_finished) {
+ }
+ 
+ void Service::Reap(const siginfo_t& siginfo) {
++    // DORA21: record bpfloader exit before normal service cleanup.
++    if (name_ == "bpfloader") {
++        const std::string message =
++                std::string("BPF_EXIT pid=") +
++                std::to_string(siginfo.si_pid) +
++                " code=" + std::to_string(siginfo.si_code) +
++                " status=" + std::to_string(siginfo.si_status);
++        Dora21Trace(message.c_str());
++    }
++
+     if (!(flags_ & SVC_ONESHOT) || (flags_ & SVC_RESTART)) {
+         KillProcessGroup(SIGKILL);
+     } else {
+diff --git a/rootdir/init.rc b/rootdir/init.rc
+index 92e8f27ba..20b87b2ab 100644
+--- a/rootdir/init.rc
++++ b/rootdir/init.rc
+@@ -1358,3 +1358,16 @@ on property:persist.device_config.mglru_native.lru_gen_config=core_and_nonleaf_y
+   write /sys/kernel/mm/lru_gen/enabled 5
+ on property:persist.device_config.mglru_native.lru_gen_config=all
+   write /sys/kernel/mm/lru_gen/enabled 7
++
++# DORA21 PERSISTENT BOOT LOGCAT
++# Diagnostic only. Remove after completing boot debugging.
++service dora21_logcapture /system/bin/logcat -b all -v threadtime -f /cache/dora21-logcat.txt -r 2048 -n 6
++    class core
++    disabled
++    oneshot
++    user root
++    group log
++    seclabel u:r:logpersist:s0
++
++on post-fs
++    start dora21_logcapture
